@@ -1053,9 +1053,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
