@@ -1,204 +1,1058 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import os
+import logging
+import io
+from datetime import datetime, timedelta
+from typing import Dict, List
+import pytz
+import json
+import pandas as pd
 
-# C extensions
-*.so
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputFile
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+    JobQueue
+)
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Конфигурация
+TELEGRAM_BOT_TOKEN = "8009687103:AAHTSA2qRElH1X6yOb1-Yr6rfQ_X5VqaPsA"
+ADMIN_CHAT_ID = None
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Состояния для ConversationHandler
+GET_FULL_NAME, GET_POSITION, SELECT_DEPARTMENT, GET_DEPARTMENT, SELECT_CHECK_PERIOD, GET_CHECK_DATE, GET_PROTOCOL_NUMBER = range(7)
+EDIT_DEPARTMENT, EDIT_EMPLOYEE, EDIT_OPTION, EDIT_DATE, EDIT_PERIOD = range(5)
+DELETE_DEPARTMENT, DELETE_EMPLOYEE = range(2)
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+# Периодичность проверки
+CHECK_PERIOD_1_YEAR = 1
+CHECK_PERIOD_3_YEARS = 3
 
-# Translations
-*.mo
-*.pot
+# Клавиатуры
+main_keyboard = ReplyKeyboardMarkup(
+    [
+        ['➕ Добавить сотрудника', '📋 Список сотрудников'],
+        ['✏️ Редактировать данные', '❌ Удалить сотрудника'],
+        ['⚠️ Проверить просроченных', '📥 Экспорт в файл'],
+        ['👨‍💻 Назначить админа']
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False
+)
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+cancel_keyboard = ReplyKeyboardMarkup(
+    [['❌ Отменить']],
+    resize_keyboard=True
+)
 
-# Flask stuff:
-instance/
-.webassets-cache
+period_keyboard = ReplyKeyboardMarkup(
+    [['1 раз в год', '1 раз в 3 года'], ['❌ Отменить']],
+    resize_keyboard=True
+)
 
-# Scrapy stuff:
-.scrapy
+edit_keyboard = ReplyKeyboardMarkup(
+    [['✏️ Дата проверки', '✏️ Периодичность'], ['❌ Отменить']],
+    resize_keyboard=True
+)
 
-# Sphinx documentation
-docs/_build/
+class Employee:
+    def __init__(self, full_name: str, position: str, department: str, last_check_date: datetime, 
+                 protocol_number: str = None, check_period: int = CHECK_PERIOD_3_YEARS):
+        self.full_name = full_name
+        self.position = position
+        self.department = department
+        self.last_check_date = last_check_date
+        self.protocol_number = protocol_number
+        self.check_period = check_period
 
-# PyBuilder
-.pybuilder/
-target/
+    def to_dict(self) -> Dict:
+        return {
+            'full_name': self.full_name,
+            'position': self.position,
+            'department': self.department,
+            'last_check_date': self.last_check_date.isoformat(),
+            'protocol_number': self.protocol_number,
+            'check_period': self.check_period
+        }
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Employee':
+        return cls(
+            full_name=data['full_name'],
+            position=data['position'],
+            department=data.get('department', 'Не указано'),
+            last_check_date=datetime.fromisoformat(data['last_check_date']),
+            protocol_number=data.get('protocol_number'),
+            check_period=data.get('check_period', CHECK_PERIOD_3_YEARS)
+        )
 
-# IPython
-profile_default/
-ipython_config.py
+    def get_next_check_date(self) -> datetime:
+        return self.last_check_date.replace(tzinfo=pytz.utc) + timedelta(days=365 * self.check_period)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+class Storage:
+    def __init__(self, data_file: str = 'employees.json'):
+        self.data_file = data_file
+        self.employees: List[Employee] = []
+        self._load_data()
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    def _save_data(self):
+        with open(self.data_file, 'w', encoding='utf-8') as f:
+            json.dump([emp.to_dict() for emp in self.employees], f, indent=4, ensure_ascii=False)
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+    def _load_data(self):
+        if os.path.exists(self.data_file):
+            with open(self.data_file, 'r', encoding='utf-8') as f:
+                try:
+                    data = json.load(f)
+                    self.employees = [Employee.from_dict(d) for d in data]
+                except (json.JSONDecodeError, KeyError):
+                    self.employees = []
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+    def add_employee(self, employee: Employee):
+        self.employees.append(employee)
+        self._save_data()
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+    def get_employees(self) -> List[Employee]:
+        return self.employees
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    def get_departments(self) -> List[str]:
+        departments = list(set(emp.department for emp in self.employees))
+        return sorted(departments)
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    def find_employee_by_name(self, full_name: str) -> Employee:
+        for emp in self.employees:
+            if emp.full_name.lower() == full_name.lower():
+                return emp
+        return None
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    def update_employee_check_date(self, full_name: str, new_date: datetime, protocol_number: str = None):
+        for emp in self.employees:
+            if emp.full_name.lower() == full_name.lower():
+                emp.last_check_date = new_date
+                if protocol_number:
+                    emp.protocol_number = protocol_number
+                self._save_data()
+                return True
+        return False
 
-# SageMath parsed files
-*.sage.py
+    def update_employee_check_period(self, full_name: str, new_period: int):
+        for emp in self.employees:
+            if emp.full_name.lower() == full_name.lower():
+                emp.check_period = new_period
+                self._save_data()
+                return True
+        return False
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+    def delete_employee(self, full_name: str):
+        initial_count = len(self.employees)
+        self.employees = [emp for emp in self.employees if emp.full_name.lower() != full_name.lower()]
+        if len(self.employees) < initial_count:
+            self._save_data()
+            return True
+        return False
 
-# Spyder project settings
-.spyderproject
-.spyproject
+    def find_overdue_employees(self, department: str = None) -> List[Employee]:
+        now = datetime.now(pytz.utc)
+        employees = self.employees
 
-# Rope project settings
-.ropeproject
+        if department:
+            employees = [emp for emp in employees if emp.department.lower() == department.lower()]
 
-# mkdocs documentation
-/site
+        return [
+            emp for emp in employees
+            if emp.get_next_check_date() <= now
+        ]
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    def find_upcoming_checks(self, days_before: int = 15, department: str = None) -> List[Employee]:
+        now = datetime.now(pytz.utc)
+        employees = self.employees
 
-# Pyre type checker
-.pyre/
+        if department:
+            employees = [emp for emp in employees if emp.department.lower() == department.lower()]
 
-# pytype static type analyzer
-.pytype/
+        result = []
+        for emp in employees:
+            check_anniversary = emp.get_next_check_date()
+            days_until_check = (check_anniversary - now).days
+            if 0 <= days_until_check <= days_before:
+                result.append(emp)
+        return result
 
-# Cython debug symbols
-cython_debug/
+storage = Storage()
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# Основные команды
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🔰 <b>Бот учета проверок знаний по охране труда</b>\n\n"
+        "Используйте кнопки ниже для управления:",
+        reply_markup=main_keyboard,
+        parse_mode='HTML'
+    )
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+async def set_admin_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global ADMIN_CHAT_ID
+    ADMIN_CHAT_ID = update.effective_chat.id
+    with open('config.json', 'w') as f:
+        json.dump({'admin_chat_id': ADMIN_CHAT_ID}, f)
+    await update.message.reply_text(
+        f"✅ Чат для уведомлений установлен (ID: {ADMIN_CHAT_ID})",
+        reply_markup=main_keyboard
+    )
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+# Добавление сотрудника
+async def add_employee_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "📝 Введите ФИО сотрудника:",
+        reply_markup=cancel_keyboard
+    )
+    return GET_FULL_NAME
 
-# Ruff stuff:
-.ruff_cache/
+async def get_full_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    context.user_data['full_name'] = update.message.text
+    await update.message.reply_text(
+        "💼 Введите должность сотрудника:",
+        reply_markup=cancel_keyboard
+    )
+    return GET_POSITION
 
-# PyPI configuration file
-.pypirc
+async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    context.user_data['position'] = update.message.text
+    
+    departments = storage.get_departments()
+    if departments:
+        departments_keyboard = ReplyKeyboardMarkup(
+            [[dept] for dept in departments] + [['➕ Новое подразделение'], ['❌ Отменить']],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await update.message.reply_text(
+            "🏢 Выберите подразделение или создайте новое:",
+            reply_markup=departments_keyboard
+        )
+        return SELECT_DEPARTMENT
+    else:
+        await update.message.reply_text(
+            "🏢 Введите название нового подразделения:",
+            reply_markup=cancel_keyboard
+        )
+        return GET_DEPARTMENT
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
+async def select_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    if update.message.text == '➕ Новое подразделение':
+        await update.message.reply_text(
+            "🏢 Введите название нового подразделения:",
+            reply_markup=cancel_keyboard
+        )
+        return GET_DEPARTMENT
+    
+    context.user_data['department'] = update.message.text
+    await update.message.reply_text(
+        "🔄 Выберите периодичность проверки знаний:",
+        reply_markup=period_keyboard
+    )
+    return SELECT_CHECK_PERIOD
+
+async def get_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    context.user_data['department'] = update.message.text
+    await update.message.reply_text(
+        "🔄 Выберите периодичность проверки знаний:",
+        reply_markup=period_keyboard
+    )
+    return SELECT_CHECK_PERIOD
+
+async def select_check_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    if update.message.text == '1 раз в год':
+        context.user_data['check_period'] = CHECK_PERIOD_1_YEAR
+    elif update.message.text == '1 раз в 3 года':
+        context.user_data['check_period'] = CHECK_PERIOD_3_YEARS
+    else:
+        await update.message.reply_text(
+            "❌ Пожалуйста, выберите один из предложенных вариантов:",
+            reply_markup=period_keyboard
+        )
+        return SELECT_CHECK_PERIOD
+    
+    await update.message.reply_text(
+        "📅 Введите дату последней проверки (ДД.ММ.ГГГГ):",
+        reply_markup=cancel_keyboard
+    )
+    return GET_CHECK_DATE
+
+async def get_check_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    try:
+        date_str = update.message.text
+        check_date = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=pytz.utc)
+        context.user_data['last_check_date'] = check_date
+        await update.message.reply_text(
+            "🔢 Введите номер протокола проверки знаний (если есть, или нажмите /skip):",
+            reply_markup=cancel_keyboard
+        )
+        return GET_PROTOCOL_NUMBER
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ:",
+            reply_markup=cancel_keyboard
+        )
+        return GET_CHECK_DATE
+
+async def get_protocol_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    protocol_number = update.message.text
+    employee = Employee(
+        full_name=context.user_data['full_name'],
+        position=context.user_data['position'],
+        department=context.user_data['department'],
+        last_check_date=context.user_data['last_check_date'],
+        protocol_number=protocol_number if protocol_number != '/skip' else None,
+        check_period=context.user_data.get('check_period', CHECK_PERIOD_3_YEARS)
+    )
+
+    storage.add_employee(employee)
+
+    period_text = "1 раз в год" if employee.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+    next_check = employee.get_next_check_date().strftime('%d.%m.%Y')
+
+    message = (
+        f"✅ Сотрудник успешно добавлен:\n\n"
+        f"<b>ФИО:</b> {employee.full_name}\n"
+        f"<b>Должность:</b> {employee.position}\n"
+        f"<b>Подразделение:</b> {employee.department}\n"
+        f"<b>Периодичность проверки:</b> {period_text}\n"
+        f"<b>Дата проверки:</b> {employee.last_check_date.strftime('%d.%m.%Y')}\n"
+        f"<b>Следующая проверка:</b> {next_check}\n"
+    )
+
+    if employee.protocol_number:
+        message += f"<b>№ протокола:</b> {employee.protocol_number}\n"
+
+    await update.message.reply_text(
+        message,
+        reply_markup=main_keyboard,
+        parse_mode='HTML'
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def skip_protocol_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    employee = Employee(
+        full_name=context.user_data['full_name'],
+        position=context.user_data['position'],
+        department=context.user_data['department'],
+        last_check_date=context.user_data['last_check_date'],
+        protocol_number=None,
+        check_period=context.user_data.get('check_period', CHECK_PERIOD_3_YEARS)
+    )
+
+    storage.add_employee(employee)
+
+    period_text = "1 раз в год" if employee.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+    next_check = employee.get_next_check_date().strftime('%d.%m.%Y')
+
+    await update.message.reply_text(
+        f"✅ Сотрудник успешно добавлен:\n\n"
+        f"<b>ФИО:</b> {employee.full_name}\n"
+        f"<b>Должность:</b> {employee.position}\n"
+        f"<b>Подразделение:</b> {employee.department}\n"
+        f"<b>Периодичность проверки:</b> {period_text}\n"
+        f"<b>Дата проверки:</b> {employee.last_check_date.strftime('%d.%m.%Y')}\n"
+        f"<b>Следующая проверка:</b> {next_check}\n"
+        f"<b>№ протокола:</b> не указан",
+        reply_markup=main_keyboard,
+        parse_mode='HTML'
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Редактирование сотрудника
+async def edit_employee_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    departments = storage.get_departments()
+
+    if not departments:
+        await update.message.reply_text(
+            "📭 Список сотрудников пуст.",
+            reply_markup=main_keyboard
+        )
+        return ConversationHandler.END
+
+    departments_keyboard = ReplyKeyboardMarkup(
+        [[dept] for dept in departments] + [['❌ Отменить']],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🏢 Выберите подразделение, в котором нужно отредактировать сотрудника:",
+        reply_markup=departments_keyboard
+    )
+    return EDIT_DEPARTMENT
+
+async def select_employee_to_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    department = update.message.text
+    employees = [emp for emp in storage.get_employees() if emp.department == department]
+
+    if not employees:
+        await update.message.reply_text(
+            f"📭 В подразделении '{department}' нет сотрудников.",
+            reply_markup=main_keyboard
+        )
+        return ConversationHandler.END
+
+    context.user_data['edit_department'] = department
+
+    employee_keyboard = ReplyKeyboardMarkup(
+        [[emp.full_name] for emp in employees] + [['❌ Отменить']],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await update.message.reply_text(
+        f"👥 Выберите сотрудника из подразделения '{department}' для редактирования:",
+        reply_markup=employee_keyboard
+    )
+    return EDIT_EMPLOYEE
+
+async def select_edit_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    full_name = update.message.text
+    department = context.user_data.get('edit_department')
+
+    employee = next((emp for emp in storage.get_employees() 
+                    if emp.full_name.lower() == full_name.lower() 
+                    and emp.department == department), None)
+
+    if not employee:
+        await update.message.reply_text(
+            f"❌ Сотрудник '{full_name}' не найден в подразделении '{department}'. Попробуйте снова:",
+            reply_markup=cancel_keyboard
+        )
+        return EDIT_EMPLOYEE
+
+    context.user_data['edit_employee'] = full_name
+    await update.message.reply_text(
+        "✏️ Выберите, что хотите отредактировать:",
+        reply_markup=edit_keyboard
+    )
+    return EDIT_OPTION
+
+async def edit_employee_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    if update.message.text == '✏️ Периодичность':
+        await update.message.reply_text(
+            "🔄 Выберите новую периодичность проверки:",
+            reply_markup=period_keyboard
+        )
+        return EDIT_PERIOD
+    
+    if update.message.text == '✏️ Дата проверки':
+        full_name = context.user_data['edit_employee']
+        employee = storage.find_employee_by_name(full_name)
+        
+        protocol_info = f" (№ {employee.protocol_number})" if employee.protocol_number else ""
+        await update.message.reply_text(
+            f"📅 Текущая дата проверки: {employee.last_check_date.strftime('%d.%m.%Y')}{protocol_info}\n"
+            "Введите новую дату проверки (ДД.ММ.ГГГГ) и номер протокола через запятую (например: 01.01.2023, ПК-123):",
+            reply_markup=cancel_keyboard
+        )
+        return EDIT_DATE
+    
+    await update.message.reply_text(
+        "Пожалуйста, выберите один из вариантов редактирования:",
+        reply_markup=edit_keyboard
+    )
+    return EDIT_OPTION
+
+async def update_employee_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    try:
+        input_text = update.message.text
+        parts = [part.strip() for part in input_text.split(',', 1)]
+
+        date_str = parts[0]
+        protocol_number = parts[1] if len(parts) > 1 else None
+
+        new_date = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=pytz.utc)
+        full_name = context.user_data['edit_employee']
+
+        if storage.update_employee_check_date(full_name, new_date, protocol_number):
+            employee = storage.find_employee_by_name(full_name)
+            next_check = employee.get_next_check_date().strftime('%d.%m.%Y')
+            
+            message = (
+                f"✅ Дата проверки для <b>{full_name}</b> обновлена на <b>{new_date.strftime('%d.%m.%Y')}</b>\n"
+                f"Следующая проверка: <b>{next_check}</b>"
+            )
+            if protocol_number:
+                message += f"\nНомер протокола: <b>{protocol_number}</b>"
+
+            await update.message.reply_text(
+                message,
+                reply_markup=main_keyboard,
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Ошибка при обновлении даты проверки.",
+                reply_markup=main_keyboard
+            )
+
+        context.user_data.clear()
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите дату в формате ДД.ММ.ГГГГ и номер протокола через запятую:",
+            reply_markup=cancel_keyboard
+        )
+        return EDIT_DATE
+
+async def update_employee_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    if update.message.text == '1 раз в год':
+        new_period = CHECK_PERIOD_1_YEAR
+    elif update.message.text == '1 раз в 3 года':
+        new_period = CHECK_PERIOD_3_YEARS
+    else:
+        await update.message.reply_text(
+            "❌ Пожалуйста, выберите один из предложенных вариантов:",
+            reply_markup=period_keyboard
+        )
+        return EDIT_PERIOD
+    
+    full_name = context.user_data['edit_employee']
+    
+    if storage.update_employee_check_period(full_name, new_period):
+        employee = storage.find_employee_by_name(full_name)
+        next_check = employee.get_next_check_date().strftime('%d.%m.%Y')
+        period_text = "1 раз в год" if new_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+        
+        await update.message.reply_text(
+            f"✅ Периодичность проверки для <b>{full_name}</b> изменена на <b>{period_text}</b>\n"
+            f"Следующая проверка: <b>{next_check}</b>",
+            reply_markup=main_keyboard,
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка при обновлении периодичности проверки.",
+            reply_markup=main_keyboard
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Удаление сотрудника
+async def delete_employee_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    departments = storage.get_departments()
+
+    if not departments:
+        await update.message.reply_text(
+            "📭 Список сотрудников пуст.",
+            reply_markup=main_keyboard
+        )
+        return ConversationHandler.END
+
+    departments_keyboard = ReplyKeyboardMarkup(
+        [[dept] for dept in departments] + [['❌ Отменить']],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🏢 Выберите подразделение, из которого нужно удалить сотрудника:",
+        reply_markup=departments_keyboard
+    )
+    return DELETE_DEPARTMENT
+
+async def select_employee_to_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    department = update.message.text
+    employees = [emp for emp in storage.get_employees() if emp.department == department]
+
+    if not employees:
+        await update.message.reply_text(
+            f"📭 В подразделении '{department}' нет сотрудников.",
+            reply_markup=main_keyboard
+        )
+        return ConversationHandler.END
+
+    context.user_data['delete_department'] = department
+
+    employee_keyboard = ReplyKeyboardMarkup(
+        [[emp.full_name] for emp in employees] + [['❌ Отменить']],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await update.message.reply_text(
+        f"👥 Выберите сотрудника из подразделения '{department}' для удаления:",
+        reply_markup=employee_keyboard
+    )
+    return DELETE_EMPLOYEE
+
+async def delete_employee_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    full_name = update.message.text
+    department = context.user_data.get('delete_department')
+
+    employee = next((emp for emp in storage.get_employees() 
+                    if emp.full_name.lower() == full_name.lower() 
+                    and emp.department == department), None)
+
+    if not employee:
+        await update.message.reply_text(
+            f"❌ Сотрудник '{full_name}' не найден в подразделении '{department}'. Попробуйте снова:",
+            reply_markup=cancel_keyboard
+        )
+        return DELETE_EMPLOYEE
+
+    if storage.delete_employee(full_name):
+        await update.message.reply_text(
+            f"✅ Сотрудник <b>{full_name}</b> удален из подразделения <b>{department}</b>.",
+            reply_markup=main_keyboard,
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка при удалении сотрудника.",
+            reply_markup=main_keyboard
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Просмотр списка
+async def list_employees(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    departments = storage.get_departments()
+
+    if not departments:
+        await update.message.reply_text(
+            "📭 Список сотрудников пуст.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    departments_keyboard = ReplyKeyboardMarkup(
+        [[dept] for dept in departments] + [['Все подразделения'], ['❌ Отменить']],
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🏢 Выберите подразделение для просмотра:",
+        reply_markup=departments_keyboard
+    )
+
+    context.user_data['action'] = 'list_employees'
+    return 'waiting_department_selection'
+
+async def show_employees_by_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    department = update.message.text
+    employees = storage.get_employees()
+
+    if department.lower() != 'все подразделения':
+        employees = [emp for emp in employees if emp.department.lower() == department.lower()]
+
+    if not employees:
+        await update.message.reply_text(
+            f"📭 В подразделении '{department}' нет сотрудников.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    chunk_size = 10
+    for i in range(0, len(employees), chunk_size):
+        chunk = employees[i:i + chunk_size]
+        message = f"📋 <b>Список сотрудников ({department}):</b>\n\n" if i == 0 else ""
+        for emp in chunk:
+            next_check = emp.get_next_check_date()
+            period_text = "1 раз в год" if emp.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+            protocol_info = f"\n  <b>№ протокола:</b> {emp.protocol_number}" if emp.protocol_number else ""
+            message += (
+                f"<b>• {emp.full_name}</b>\n"
+                f"  Должность: {emp.position}\n"
+                f"  Подразделение: {emp.department}\n"
+                f"  Периодичность: {period_text}\n"
+                f"  Последняя проверка: {emp.last_check_date.strftime('%d.%m.%Y')}\n"
+                f"  Следующая проверка: {next_check.strftime('%d.%m.%Y')}"
+                f"{protocol_info}\n\n"
+            )
+        await update.message.reply_text(
+            message,
+            reply_markup=main_keyboard if i + chunk_size >= len(employees) else None,
+            parse_mode='HTML'
+        )
+
+# Проверка просроченных
+async def check_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    departments = storage.get_departments()
+
+    if not departments:
+        await update.message.reply_text(
+            "📭 Список сотрудников пуст.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    departments_keyboard = ReplyKeyboardMarkup(
+        [[dept] for dept in departments] + [['Все подразделения'], ['❌ Отменить']],
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🏢 Выберите подразделение для проверки:",
+        reply_markup=departments_keyboard
+    )
+
+    context.user_data['action'] = 'check_overdue'
+    return 'waiting_department_selection'
+
+async def show_overdue_by_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    department = update.message.text
+    overdue = storage.find_overdue_employees(department if department.lower() != 'все подразделения' else None)
+
+    if not overdue:
+        await update.message.reply_text(
+            f"✅ В подразделении '{department}' нет сотрудников с просроченной проверкой.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    message = f"⚠️ <b>Просроченные проверки ({department}):</b>\n\n"
+    for emp in overdue:
+        period_text = "1 раз в год" if emp.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+        protocol_info = f"\n  <b>№ протокола:</b> {emp.protocol_number}" if emp.protocol_number else ""
+        message += (
+            f"<b>• {emp.full_name}</b> ({emp.position})\n"
+            f"  Подразделение: {emp.department}\n"
+            f"  Периодичность: {period_text}\n"
+            f"  Последняя проверка: {emp.last_check_date.strftime('%d.%m.%Y')}"
+            f"{protocol_info}\n\n"
+        )
+    await update.message.reply_text(
+        message,
+        reply_markup=main_keyboard,
+        parse_mode='HTML'
+    )
+
+# Экспорт данных
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    departments = storage.get_departments()
+
+    if not departments:
+        await update.message.reply_text(
+            "📭 Список сотрудников пуст",
+            reply_markup=main_keyboard
+        )
+        return
+
+    departments_keyboard = ReplyKeyboardMarkup(
+        [[dept] for dept in departments] + [['Все подразделения'], ['❌ Отменить']],
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🏢 Выберите подразделение для экспорта:",
+        reply_markup=departments_keyboard
+    )
+
+    context.user_data['action'] = 'export_data'
+    return 'waiting_department_selection'
+
+async def export_data_by_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    department = update.message.text
+    employees = storage.get_employees()
+
+    if department.lower() != 'все подразделения':
+        employees = [emp for emp in employees if emp.department.lower() == department.lower()]
+
+    if not employees:
+        await update.message.reply_text(
+            f"📭 В подразделении '{department}' нет сотрудников.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    data = {
+        'ФИО': [],
+        'Должность': [],
+        'Подразделение': [],
+        'Периодичность': [],
+        'Дата последней проверки': [],
+        '№ протокола': [],
+        'Дата следующей проверки': []
+    }
+
+    for emp in employees:
+        data['ФИО'].append(emp.full_name)
+        data['Должность'].append(emp.position)
+        data['Подразделение'].append(emp.department)
+        data['Периодичность'].append("1 раз в год" if emp.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года")
+        data['Дата последней проверки'].append(emp.last_check_date.strftime('%d.%m.%Y'))
+        data['№ протокола'].append(emp.protocol_number or 'не указан')
+        data['Дата следующей проверки'].append(emp.get_next_check_date().strftime('%d.%m.%Y'))
+
+    df = pd.DataFrame(data)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Сотрудники')
+        writer.close()
+
+    output.seek(0)
+    await update.message.reply_document(
+        document=InputFile(output, filename=f'сотрудники_{department}.xlsx'),
+        caption=f"📥 <b>Экспорт данных сотрудников ({department})</b>",
+        reply_markup=main_keyboard,
+        parse_mode='HTML'
+    )
+
+# Обработчик выбора подразделения
+async def handle_department_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.text == '❌ Отменить':
+        return await cancel(update, context)
+    
+    action = context.user_data.get('action')
+
+    if action == 'list_employees':
+        await show_employees_by_department(update, context)
+    elif action == 'check_overdue':
+        await show_overdue_by_department(update, context)
+    elif action == 'export_data':
+        await export_data_by_department(update, context)
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Уведомления
+async def send_overdue_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_CHAT_ID:
+        return
+
+    departments = storage.get_departments()
+    if not departments:
+        return
+
+    for department in departments:
+        overdue = storage.find_overdue_employees(department)
+        if not overdue:
+            continue
+
+        message = f"🔴 <b>Просроченные проверки знаний ({department}):</b>\n\n"
+        for emp in overdue:
+            period_text = "1 раз в год" if emp.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+            protocol_info = f"\n  <b>№ протокола:</b> {emp.protocol_number}" if emp.protocol_number else ""
+            message += (
+                f"• <b>{emp.full_name}</b> ({emp.position})\n"
+                f"  Периодичность: {period_text}\n"
+                f"  Последняя проверка: {emp.last_check_date.strftime('%d.%m.%Y')}"
+                f"{protocol_info}\n\n"
+            )
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+
+async def send_upcoming_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_CHAT_ID:
+        return
+
+    departments = storage.get_departments()
+    if not departments:
+        return
+
+    for department in departments:
+        upcoming = storage.find_upcoming_checks(department=department)
+        if not upcoming:
+            continue
+
+        message = f"🟡 <b>Предстоящие проверки знаний ({department}):</b>\n\n"
+        for emp in upcoming:
+            next_check = emp.get_next_check_date()
+            days_left = (next_check - datetime.now(pytz.utc)).days
+            period_text = "1 раз в год" if emp.check_period == CHECK_PERIOD_1_YEAR else "1 раз в 3 года"
+            protocol_info = f"\n  <b>№ протокола:</b> {emp.protocol_number}" if emp.protocol_number else ""
+            message += (
+                f"• <b>{emp.full_name}</b> ({emp.position})\n"
+                f"  Периодичность: {period_text}\n"
+                f"  Проверка до: {next_check.strftime('%d.%m.%Y')}\n"
+                f"  Осталось дней: {days_left}"
+                f"{protocol_info}\n\n"
+            )
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=message,
+            parse_mode='HTML'
+        )
+
+# Отмена операций
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "❌ Операция отменена.",
+        reply_markup=main_keyboard
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+def setup_jobs(application):
+    job_queue = application.job_queue
+    job_queue.run_daily(send_overdue_notifications, time=datetime.strptime("09:00", "%H:%M").time())
+    job_queue.run_daily(send_upcoming_notifications, time=datetime.strptime("09:30", "%H:%M").time())
+
+def main() -> None:
+    global ADMIN_CHAT_ID
+    if os.path.exists('config.json'):
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+            ADMIN_CHAT_ID = config.get('admin_chat_id')
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Обработчики команд
+    add_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('add', add_employee_start),
+            MessageHandler(filters.Regex(r'^➕ Добавить сотрудника$'), add_employee_start)
+        ],
+        states={
+            GET_FULL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_full_name)],
+            GET_POSITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_position)],
+            SELECT_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_department)],
+            GET_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_department)],
+            SELECT_CHECK_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_check_period)],
+            GET_CHECK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_check_date)],
+            GET_PROTOCOL_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_protocol_number),
+                CommandHandler('skip', skip_protocol_number)
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex(r'^❌ Отменить$'), cancel)
+        ],
+    )
+
+    edit_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('edit', edit_employee_start),
+            MessageHandler(filters.Regex(r'^✏️ Редактировать данные$'), edit_employee_start)
+        ],
+        states={
+            EDIT_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_employee_to_edit)],
+            EDIT_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_edit_option)],
+            EDIT_OPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_employee_option)],
+            EDIT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_employee_date)],
+            EDIT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_employee_period)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex(r'^❌ Отменить$'), cancel)
+        ],
+    )
+
+    delete_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('delete', delete_employee_start),
+            MessageHandler(filters.Regex(r'^❌ Удалить сотрудника$'), delete_employee_start)
+        ],
+        states={
+            DELETE_DEPARTMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_employee_to_delete)],
+            DELETE_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_employee_confirm)],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex(r'^❌ Отменить$'), cancel)
+        ],
+    )
+
+    department_selection_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r'^📋 Список сотрудников$'), list_employees),
+            MessageHandler(filters.Regex(r'^⚠️ Проверить просроченных$'), check_overdue),
+            MessageHandler(filters.Regex(r'^📥 Экспорт в файл$'), export_data)
+        ],
+        states={
+            'waiting_department_selection': [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_department_selection),
+                MessageHandler(filters.Regex(r'^Все подразделения$'), handle_department_selection)
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex(r'^❌ Отменить$'), cancel)
+        ],
+    )
+
+    # Регистрация обработчиков
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('set_admin_chat', set_admin_chat))
+    application.add_handler(MessageHandler(filters.Regex(r'^👨‍💻 Назначить админа$'), set_admin_chat))
+
+    application.add_handler(add_conv_handler)
+    application.add_handler(edit_conv_handler)
+    application.add_handler(delete_conv_handler)
+    application.add_handler(department_selection_handler)
+
+    # Настройка заданий
+    setup_jobs(application)
+
+    # Запуск бота
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
 .cursorindexingignore
 
 # Marimo
